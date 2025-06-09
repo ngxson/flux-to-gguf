@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import ast
+import logging
+import argparse
+import contextlib
+import json
+import os
+import re
+import sys
+from enum import IntEnum
+from pathlib import Path
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
+from itertools import chain
+from torch import Tensor
+
+import math
+import numpy as np
+import torch
+import gguf
+import ctypes
+
+logger = logging.getLogger(__name__)
+
+class QuantConfig():
+    ftype: gguf.LlamaFileType
+    qtype: gguf.GGMLQuantizationType
+    use_dll: bool = False  # whether to use native DLL function
+
+    def __init__(self, ftype: gguf.LlamaFileType, qtype: gguf.GGMLQuantizationType):
+        self.ftype = ftype
+        self.qtype = qtype
+        self.use_dll = "_K" in qtype.name
+
+
+qconfig_map: dict[str, QuantConfig] = {
+    "F16": QuantConfig(gguf.LlamaFileType.MOSTLY_F16, gguf.GGMLQuantizationType.F16),
+    "BF16": QuantConfig(gguf.LlamaFileType.MOSTLY_BF16, gguf.GGMLQuantizationType.BF16),
+    "Q8_0": QuantConfig(gguf.LlamaFileType.MOSTLY_Q8_0, gguf.GGMLQuantizationType.Q8_0),
+    "Q6_K": QuantConfig(gguf.LlamaFileType.MOSTLY_Q6_K, gguf.GGMLQuantizationType.Q6_K),
+    "Q5_K_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q5_K_S, gguf.GGMLQuantizationType.Q5_K),
+    "Q5_1": QuantConfig(gguf.LlamaFileType.MOSTLY_Q5_1, gguf.GGMLQuantizationType.Q5_1),
+    "Q5_0": QuantConfig(gguf.LlamaFileType.MOSTLY_Q5_0, gguf.GGMLQuantizationType.Q5_0),
+    "Q4_K_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q4_K_S, gguf.GGMLQuantizationType.Q4_K),
+    "Q4_1": QuantConfig(gguf.LlamaFileType.MOSTLY_Q4_1, gguf.GGMLQuantizationType.Q4_1),
+    "Q4_0": QuantConfig(gguf.LlamaFileType.MOSTLY_Q4_0, gguf.GGMLQuantizationType.Q4_0),
+    "Q3_K_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q3_K_S, gguf.GGMLQuantizationType.Q3_K),
+    "Q2_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q2_K, gguf.GGMLQuantizationType.Q2_K),
+}
+
+
+# tree of lazy tensors
+class LazyTorchTensor(gguf.LazyBase):
+    _tensor_type = torch.Tensor
+    # to keep the type-checker happy
+    dtype: torch.dtype
+    shape: torch.Size
+
+    # only used when converting a torch.Tensor to a np.ndarray
+    _dtype_map: dict[torch.dtype, type] = {
+        torch.float16: np.float16,
+        torch.float32: np.float32,
+    }
+
+    # used for safetensors slices
+    # ref: https://github.com/huggingface/safetensors/blob/079781fd0dc455ba0fe851e2b4507c33d0c0d407/bindings/python/src/lib.rs#L1046
+    # TODO: uncomment U64, U32, and U16, ref: https://github.com/pytorch/pytorch/issues/58734
+    _dtype_str_map: dict[str, torch.dtype] = {
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "BF16": torch.bfloat16,
+        "F16": torch.float16,
+        # "U64": torch.uint64,
+        "I64": torch.int64,
+        # "U32": torch.uint32,
+        "I32": torch.int32,
+        # "U16": torch.uint16,
+        "I16": torch.int16,
+        "U8": torch.uint8,
+        "I8": torch.int8,
+        "BOOL": torch.bool,
+        "F8_E4M3": torch.float8_e4m3fn,
+        "F8_E5M2": torch.float8_e5m2,
+    }
+
+    def numpy(self) -> gguf.LazyNumpyTensor:
+        dtype = self._dtype_map[self.dtype]
+        return gguf.LazyNumpyTensor(
+            meta=gguf.LazyNumpyTensor.meta_with_dtype_and_shape(dtype, self.shape),
+            args=(self,),
+            func=(lambda s: s.numpy())
+        )
+
+    @classmethod
+    def meta_with_dtype_and_shape(cls, dtype: torch.dtype, shape: tuple[int, ...]) -> Tensor:
+        return torch.empty(size=shape, dtype=dtype, device="meta")
+
+    @classmethod
+    def from_safetensors_slice(cls, st_slice: Any) -> Tensor:
+        dtype = cls._dtype_str_map[st_slice.get_dtype()]
+        shape: tuple[int, ...] = tuple(st_slice.get_shape())
+        lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(st_slice,), func=lambda s: s[:])
+        return cast(torch.Tensor, lazy)
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        del types  # unused
+
+        if kwargs is None:
+            kwargs = {}
+
+        if func is torch.Tensor.numpy:
+            return args[0].numpy()
+
+        return cls._wrap_fn(func)(*args, **kwargs)
+
+
+class Converter():
+    path_safetensors: Path
+    endianess: gguf.GGUFEndian
+    outtype: QuantConfig
+    outfile: Path
+    gguf_writer: gguf.GGUFWriter
+
+    def __init__(self, path_safetensors: Path, endianess: gguf.GGUFEndian, outtype: QuantConfig, outfile: Path):
+        self.path_safetensors = path_safetensors
+        self.endianess = endianess
+        self.outtype = outtype
+        self.outfile = outfile
+
+        self.gguf_writer = gguf.GGUFWriter(path=None, arch="flux", endianess=self.endianess)
+        self.gguf_writer.add_file_type(self.outtype.ftype)
+
+        # load tensors and process
+        from safetensors import safe_open
+        ctx = cast(ContextManager[Any], safe_open(path_safetensors, framework="pt", device="cpu"))
+        with ctx as model_part:
+            for name in model_part.keys():
+                data = model_part.get_slice(name)
+                data = LazyTorchTensor.from_safetensors_slice(data)
+                self.process_tensor(name, data)
+
+
+    def process_tensor(self, name: str, data_torch: LazyTorchTensor) -> None:
+        is_1d = len(data_torch.shape) == 1
+        current_dtype = data_torch.dtype
+        target_dtype = gguf.GGMLQuantizationType.F32 if is_1d else self.outtype.qtype
+
+        if data_torch.dtype not in (torch.float16, torch.float32):
+            data_torch = data_torch.to(torch.float32)
+
+        data = data_torch.numpy()
+
+        if current_dtype != target_dtype:
+            try:
+                data = gguf.quants.quantize(data, target_dtype)
+            except gguf.QuantError as e:
+                logger.warning("%s, %s", e, "falling back to F16")
+                target_dtype = gguf.GGMLQuantizationType.F16
+                data = gguf.quants.quantize(data, target_dtype)
+
+        # reverse shape to make it similar to the internal ggml dimension order
+        shape = gguf.quant_shape_from_byte_shape(data.shape, target_dtype) if data.dtype == np.uint8 else data.shape
+        shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
+        logger.info(f"{f'%-32s' % f'{name},'} {current_dtype} --> {target_dtype.name}, shape = {shape_str}")
+
+        # add tensor to gguf
+        self.gguf_writer.add_tensor(name, data, raw_dtype=target_dtype)
+
+    def write(self) -> None:
+        self.gguf_writer.write_header_to_file(path=self.outfile)
+        self.gguf_writer.write_kv_data_to_file()
+        self.gguf_writer.write_tensors_to_file(progress=True)
+        self.gguf_writer.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert a flux model to GGUF")
+    parser.add_argument(
+        "--outfile", type=Path, default=Path("model-{ftype}.gguf"),
+        help="path to write to; default: based on input. {ftype} will be replaced by the outtype",
+    )
+    parser.add_argument(
+        "--outtype", type=str, choices=qconfig_map.keys(), default="F16",
+        help="output quantization scheme",
+    )
+    parser.add_argument(
+        "--bigendian", action="store_true",
+        help="model is executed on big endian machine",
+    )
+    parser.add_argument(
+        "model", type=Path,
+        help="directory containing safetensors model file",
+        nargs="?",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="increase output verbosity",
+    )
+
+    args = parser.parse_args()
+    if args.model is None:
+        parser.error("the following arguments are required: model")
+    return args
+
+def main() -> None:
+    args = parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    if not args.model.is_file():
+        logging.error(f"Model path {args.model} does not exist.")
+        sys.exit(1)
+
+    if args.model.suffix != ".safetensors":
+        logging.error(f"Model path {args.model} is not a safetensors file.")
+        sys.exit(1)
+
+    if args.outfile.suffix != ".gguf":
+        logging.error("Output file must have .gguf extension.")
+        sys.exit(1)
+
+    qconfig = qconfig_map[args.outtype]
+    outfile = args.outfile.with_name(args.outfile.stem.replace("{ftype}", args.outtype)) if "{ftype}" in str(args.outfile) else args.outfile
+
+    logger.info(f"Converting model in {args.model} to {outfile} with quantization {args.outtype}")
+    converter = Converter(
+        path_safetensors=args.model,
+        endianess=gguf.GGUFEndian.BIG if args.bigendian else gguf.GGUFEndian.LITTLE,
+        outtype=qconfig,
+        outfile=outfile
+    )
+    converter.write()
+    logger.info(f"Conversion complete. Output written to {outfile}")
+
+if __name__ == "__main__":
+    main()
