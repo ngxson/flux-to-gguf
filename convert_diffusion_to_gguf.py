@@ -139,6 +139,7 @@ class Converter():
 
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=arch, endianess=self.endianess)
         self.gguf_writer.add_file_type(self.outtype.ftype)
+        self.gguf_writer.add_type("diffusion") # for HF hub to detect the type correctly
 
         # load tensors and process
         from safetensors import safe_open
