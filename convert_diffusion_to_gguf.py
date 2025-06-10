@@ -34,12 +34,10 @@ logger = logging.getLogger(__name__)
 class QuantConfig():
     ftype: gguf.LlamaFileType
     qtype: gguf.GGMLQuantizationType
-    use_dll: bool = False  # whether to use native DLL function
 
     def __init__(self, ftype: gguf.LlamaFileType, qtype: gguf.GGMLQuantizationType):
         self.ftype = ftype
         self.qtype = qtype
-        self.use_dll = "_K" in qtype.name
 
 
 qconfig_map: dict[str, QuantConfig] = {
@@ -54,7 +52,7 @@ qconfig_map: dict[str, QuantConfig] = {
     "Q4_1": QuantConfig(gguf.LlamaFileType.MOSTLY_Q4_1, gguf.GGMLQuantizationType.Q4_1),
     "Q4_0": QuantConfig(gguf.LlamaFileType.MOSTLY_Q4_0, gguf.GGMLQuantizationType.Q4_0),
     "Q3_K_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q3_K_S, gguf.GGMLQuantizationType.Q3_K),
-    "Q2_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q2_K, gguf.GGMLQuantizationType.Q2_K),
+    #"Q2_S": QuantConfig(gguf.LlamaFileType.MOSTLY_Q2_K, gguf.GGMLQuantizationType.Q2_K), # not yet supported in python
 }
 
 
@@ -162,12 +160,13 @@ class Converter():
         data = data_torch.numpy()
 
         if current_dtype != target_dtype:
+            from custom_quants import quantize as custom_quantize, QuantError
             try:
-                data = gguf.quants.quantize(data, target_dtype)
-            except gguf.QuantError as e:
+                data = custom_quantize(data, target_dtype)
+            except QuantError as e:
                 logger.warning("%s, %s", e, "falling back to F16")
                 target_dtype = gguf.GGMLQuantizationType.F16
-                data = gguf.quants.quantize(data, target_dtype)
+                data = custom_quantize(data, target_dtype)
 
         # reverse shape to make it similar to the internal ggml dimension order
         shape = gguf.quant_shape_from_byte_shape(data.shape, target_dtype) if data.dtype == np.uint8 else data.shape
@@ -287,7 +286,7 @@ def main() -> None:
         sys.exit(1)
 
     qconfig = qconfig_map[args.outtype]
-    outfile = Path(str(args.outfile).format(ftype=qconfig.qtype.name.upper()))
+    outfile = Path(str(args.outfile).format(ftype=args.outtype.upper()))
 
     logger.info(f"Converting model in {args.model} to {outfile} with quantization {args.outtype}")
     converter = Converter(
