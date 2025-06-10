@@ -25,6 +25,10 @@ import torch
 import gguf
 import ctypes
 
+
+# TODO: add more:
+SUPPORTED_ARCHS = ["flux", "sd3", "ltxv", "hyvid", "wan", "hidream"]
+
 logger = logging.getLogger(__name__)
 
 class QuantConfig():
@@ -127,13 +131,13 @@ class Converter():
     outfile: Path
     gguf_writer: gguf.GGUFWriter
 
-    def __init__(self, path_safetensors: Path, endianess: gguf.GGUFEndian, outtype: QuantConfig, outfile: Path):
+    def __init__(self, arch: str, path_safetensors: Path, endianess: gguf.GGUFEndian, outtype: QuantConfig, outfile: Path):
         self.path_safetensors = path_safetensors
         self.endianess = endianess
         self.outtype = outtype
         self.outfile = outfile
 
-        self.gguf_writer = gguf.GGUFWriter(path=None, arch="flux", endianess=self.endianess)
+        self.gguf_writer = gguf.GGUFWriter(path=None, arch=arch, endianess=self.endianess)
         self.gguf_writer.add_file_type(self.outtype.ftype)
 
         # load tensors and process
@@ -209,11 +213,15 @@ def parse_args() -> argparse.Namespace:
         description="Convert a flux model to GGUF")
     parser.add_argument(
         "--outfile", type=Path, default=Path("model-{ftype}.gguf"),
-        help="path to write to; default: based on input. {ftype} will be replaced by the outtype",
+        help="path to write to; default: 'model-{ftype}.gguf' ; note: {ftype} will be replaced by the outtype",
     )
     parser.add_argument(
         "--outtype", type=str, choices=qconfig_map.keys(), default="F16",
         help="output quantization scheme",
+    )
+    parser.add_argument(
+        "--arch", type=str, choices=SUPPORTED_ARCHS,
+        help="output model architecture",
     )
     parser.add_argument(
         "--bigendian", action="store_true",
@@ -232,6 +240,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.model is None:
         parser.error("the following arguments are required: model")
+    if args.arch is None:
+        parser.error("the following arguments are required: --arch")
+    if args.arch not in SUPPORTED_ARCHS:
+        parser.error(f"Unsupported architecture: {args.arch}. Supported architectures: {', '.join(SUPPORTED_ARCHS)}")
     return args
 
 def main() -> None:
@@ -274,17 +286,18 @@ def main() -> None:
         sys.exit(1)
 
     qconfig = qconfig_map[args.outtype]
-    outfile = args.outfile.with_name(args.outfile.stem.replace("{ftype}", args.outtype)) if "{ftype}" in str(args.outfile) else args.outfile
+    outfile = Path(str(args.outfile).format(ftype=qconfig.qtype.name.upper()))
 
     logger.info(f"Converting model in {args.model} to {outfile} with quantization {args.outtype}")
     converter = Converter(
+        arch=args.arch,
         path_safetensors=args.model,
         endianess=gguf.GGUFEndian.BIG if args.bigendian else gguf.GGUFEndian.LITTLE,
         outtype=qconfig,
         outfile=outfile
     )
     converter.write()
-    logger.info(f"Conversion complete. Output written to {outfile}")
+    logger.info(f"Conversion complete. Output written to {outfile}, architecture: {args.arch}, quantization: {qconfig.qtype.name}")
 
 if __name__ == "__main__":
     main()
