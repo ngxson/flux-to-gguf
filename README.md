@@ -1,5 +1,7 @@
 # Convert diffusion (Flux, SD, etc) safetensors to GGUF
 
+**THIS IS A WIP**
+
 Example usage:
 
 ```sh
@@ -13,4 +15,4 @@ python convert_diffusion_to_gguf.py ../models/FLUX.1-dev/flux1-dev.safetensors -
 # to view help: python convert_diffusion_to_gguf.py -h
 ```
 
-TODO: `Qx_K` quants currently not implemented in python, we will need to use `libggml`
+Note: `Q2_K` is not yet supported
