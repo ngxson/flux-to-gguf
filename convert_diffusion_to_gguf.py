@@ -3,28 +3,20 @@
 
 from __future__ import annotations
 
-import ast
 import logging
 import argparse
-import contextlib
 import json
 import safetensors.torch
 import os
-import re
 import sys
-from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
-from itertools import chain
+from typing import Any, ContextManager, cast
 from torch import Tensor
 
-import math
 import numpy as np
 import torch
 import gguf
-import ctypes
-
 
 # TODO: add more:
 SUPPORTED_ARCHS = ["flux", "sd3", "ltxv", "hyvid", "wan", "hidream"]
@@ -129,7 +121,17 @@ class Converter():
     outfile: Path
     gguf_writer: gguf.GGUFWriter
 
-    def __init__(self, arch: str, path_safetensors: Path, endianess: gguf.GGUFEndian, outtype: QuantConfig, outfile: Path):
+    def __init__(
+        self, 
+        arch: str, 
+        path_safetensors: Path, 
+        endianess: gguf.GGUFEndian, 
+        outtype: QuantConfig, 
+        outfile: Path,
+        subfolder: str = None,
+        repo_id: str = None, 
+        is_diffusers: bool = False
+    ):
         self.path_safetensors = path_safetensors
         self.endianess = endianess
         self.outtype = outtype
@@ -138,6 +140,12 @@ class Converter():
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=arch, endianess=self.endianess)
         self.gguf_writer.add_file_type(self.outtype.ftype)
         self.gguf_writer.add_type("diffusion") # for HF hub to detect the type correctly
+        if repo_id:
+            self.gguf_writer.add_string("repo_id", repo_id)
+        if subfolder:
+            self.gguf_writer.add_string("subfolder", subfolder)
+        if is_diffusers:
+            self.gguf_writer.add_bool("is_diffusers", True)
 
         # load tensors and process
         from safetensors import safe_open
@@ -232,6 +240,8 @@ def parse_args() -> argparse.Namespace:
         help="directory containing safetensors model file",
         nargs="?",
     )
+    parser.add_argument("--cache_dir", type=Path, help="Directory to store the intermediate files when needed.")
+    parser.add_argument("--subfolder", type=Path, default=None, help="Subfolder on the HF Hub to load checkpoints from.")
     parser.add_argument(
         "--verbose", action="store_true",
         help="increase output verbosity",
@@ -255,9 +265,12 @@ def main() -> None:
         logging.basicConfig(level=logging.INFO)
 
     if not args.model.is_dir() and not args.model.is_file():
-        logging.error(f"Model path {args.model} does not exist.")
-        sys.exit(1)
+        if not len(str(args.model).split("/")) == 2:
+            logging.error(f"Model path {args.model} does not exist.")
+            sys.exit(1)
 
+    is_diffusers = False
+    repo_id = None
     if args.model.is_dir():
         logging.info("Supplied a directory.")
         merged_state_dict = None
@@ -271,11 +284,28 @@ def main() -> None:
             args.model = files[0]
         if n > 1:
             assert args.model / "diffusion_pytorch_model.safetensors.index.json" in list(args.model.glob("*.*"))
+            assert args.cache_dir
             merged_state_dict = _merge_sharded_checkpoints(args.model)
-            filepath = "merged_state_dict.safetensors"
+            filepath = args.cache_dir / "merged_state_dict.safetensors"
             safetensors.torch.save_file(merged_state_dict, filepath)
             logging.info(f"Serialized merged state dict to {filepath}")
             args.model = Path(filepath)
+    
+    elif len(str(args.model).split("/")) == 2:
+        from huggingface_hub import snapshot_download
+
+        logging.info("Hub repo ID detected.")
+        allow_patterns = f"{args.subfolder}/*.*" if args.subfolder else None
+        local_dir = snapshot_download(repo_id=str(args.model), local_dir=args.cache_dir, allow_patterns=allow_patterns)
+        repo_id = str(args.model)
+        local_dir = Path(local_dir)
+        local_dir = local_dir / args.subfolder if args.subfolder else local_dir
+        merged_state_dict = _merge_sharded_checkpoints(local_dir)
+        filepath = args.cache_dir / "merged_state_dict.safetensors" if args.cache_dir else "merged_state_dict.safetensors"
+        safetensors.torch.save_file(merged_state_dict, filepath)
+        logging.info(f"Serialized merged state dict to {filepath}")
+        args.model = Path(filepath)
+        is_diffusers = True
 
     if args.model.suffix != ".safetensors":
         logging.error(f"Model path {args.model} is not a safetensors file.")
@@ -294,7 +324,10 @@ def main() -> None:
         path_safetensors=args.model,
         endianess=gguf.GGUFEndian.BIG if args.bigendian else gguf.GGUFEndian.LITTLE,
         outtype=qconfig,
-        outfile=outfile
+        outfile=outfile,
+        repo_id=repo_id,
+        subfolder=str(args.subfolder) if args.subfolder else None,
+        is_diffusers=is_diffusers,
     )
     converter.write()
     logger.info(f"Conversion complete. Output written to {outfile}, architecture: {args.arch}, quantization: {qconfig.qtype.name}")
